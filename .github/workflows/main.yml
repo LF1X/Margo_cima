@@ -1,8 +1,9 @@
 name: Auto Cycle
 
-on:
+"on":
   schedule:
     - cron: "0 * * * *"
+
   workflow_dispatch:
 
 permissions:
@@ -14,39 +15,52 @@ concurrency:
 
 jobs:
   run-bot:
+    name: Run Telegram Bots
     runs-on: ubuntu-latest
     timeout-minutes: 135
 
     env:
       TZ: Africa/Cairo
+      DOCKER_BUILDKIT: "1"
 
     steps:
+      # ==========================================
+      # 1. التحقق من موعد التشغيل بتوقيت مصر
+      # ==========================================
       - name: Check Egypt Time
         id: schedule
         shell: bash
         run: |
-          HOUR=$(date +%H)
+          set -euo pipefail
 
-          echo "Egypt time: $(date)"
-          echo "Current hour: $HOUR"
+          HOUR=$(TZ=Africa/Cairo date +%H)
+          CURRENT_TIME=$(TZ=Africa/Cairo date '+%Y-%m-%d %H:%M:%S')
+
+          echo "Current Egypt time: $CURRENT_TIME"
 
           WORK_HOURS="09 10 21 22"
 
           if [[ " $WORK_HOURS " == *" $HOUR "* ]]; then
             echo "allowed=true" >> "$GITHUB_OUTPUT"
-            echo "Inside working hours."
+            echo "Allowed operating hour: $HOUR"
           elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "allowed=true" >> "$GITHUB_OUTPUT"
-            echo "Manual start enabled."
+            echo "Manual execution enabled."
           else
             echo "allowed=false" >> "$GITHUB_OUTPUT"
-            echo "Outside working hours."
+            echo "Outside allowed hours. Skipping execution."
           fi
 
+      # ==========================================
+      # 2. تحميل المستودع العام
+      # ==========================================
       - name: Checkout Public Repository
         if: steps.schedule.outputs.allowed == 'true'
         uses: actions/checkout@v4
 
+      # ==========================================
+      # 3. تحميل مستودع البوتات الخاص
+      # ==========================================
       - name: Checkout Private Repository
         if: steps.schedule.outputs.allowed == 'true'
         uses: actions/checkout@v4
@@ -54,29 +68,49 @@ jobs:
           repository: BXF8/PX
           token: ${{ secrets.GH_TOKEN }}
           path: private
+          persist-credentials: false
 
-      - name: Verify Files
+      # ==========================================
+      # 4. التحقق من الملفات المطلوبة
+      # ==========================================
+      - name: Verify Required Files
         if: steps.schedule.outputs.allowed == 'true'
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          test -f private/Dockerfile || {
-            echo "Dockerfile not found"
-            exit 1
-          }
+          echo "Checking Dockerfile..."
+          test -f private/Dockerfile
 
-          test -f private/start.sh || {
-            echo "start.sh not found"
-            exit 1
-          }
+          echo "Checking start.sh..."
+          test -f private/start.sh
 
-          echo "Required files found."
+          echo "Checking requirements.txt..."
+          test -f private/requirements.txt
 
+          echo "Checking bot files..."
+
+          for bot in bot1.py bot2.py bot3.py bot4.py bot5.py main.py; do
+            if [[ ! -f "private/bots/$bot" ]]; then
+              echo "ERROR: Missing private/bots/$bot"
+              exit 1
+            fi
+
+            echo "Found: bots/$bot"
+          done
+
+          echo "All required files found."
+
+      # ==========================================
+      # 5. إعداد Docker Buildx
+      # ==========================================
       - name: Set up Docker Buildx
         if: steps.schedule.outputs.allowed == 'true'
         uses: docker/setup-buildx-action@v3
 
+      # ==========================================
+      # 6. بناء Docker Image مع Cache دائم نسبيًا
+      # ==========================================
       - name: Build Docker Image
         if: steps.schedule.outputs.allowed == 'true'
         uses: docker/build-push-action@v6
@@ -85,58 +119,108 @@ jobs:
           file: ./private/Dockerfile
           tags: telegram-bot:latest
           load: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-      - name: Run start.sh for Two Hours
+          cache-from: type=gha,scope=telegram-bot
+          cache-to: type=gha,scope=telegram-bot,mode=max
+
+      # ==========================================
+      # 7. تشغيل البوتات لمدة ساعتين
+      # ==========================================
+      - name: Run All Bots for Two Hours
         if: steps.schedule.outputs.allowed == 'true'
         shell: bash
         run: |
           set -Eeuo pipefail
 
           CONTAINER_NAME="telegram-bot-cycle"
+          LOG_PID=""
 
           cleanup() {
-            echo "Stopping container..."
+            echo "Cleaning up container..."
+
+            if [[ -n "$LOG_PID" ]]; then
+              kill "$LOG_PID" 2>/dev/null || true
+              wait "$LOG_PID" 2>/dev/null || true
+              LOG_PID=""
+            fi
+
             docker stop --time 20 "$CONTAINER_NAME" 2>/dev/null || true
             docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           }
 
+          trap cleanup EXIT
+
+          # إزالة أي حاوية قديمة بنفس الاسم
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-          echo "Starting start.sh..."
+          echo "========================================"
+          echo "Starting Telegram bots..."
+          echo "Egypt time: $(TZ=Africa/Cairo date)"
+          echo "Runtime: 2 hours"
+          echo "========================================"
 
+          # تشغيل الحاوية
           docker run -d \
             --name "$CONTAINER_NAME" \
             --init \
+            --restart=no \
             -e TZ=Africa/Cairo \
             telegram-bot:latest
 
-          trap cleanup EXIT INT TERM
+          echo "Container started successfully."
 
-          echo "start.sh is running."
-          echo "Maximum runtime: 2 hours."
+          # عرض سجلات البوتات مباشرة
+          docker logs -f --tail 100 "$CONTAINER_NAME" &
+          LOG_PID=$!
 
+          # مدة التشغيل: 7200 ثانية
           END=$((SECONDS + 7200))
 
           while (( SECONDS < END )); do
+
             RUNNING=$(docker inspect \
               --format '{{.State.Running}}' \
               "$CONTAINER_NAME" 2>/dev/null || echo false)
 
             if [[ "$RUNNING" != "true" ]]; then
-              echo "Container stopped unexpectedly."
-              docker logs "$CONTAINER_NAME" 2>&1 || true
+              echo "ERROR: Container stopped unexpectedly."
+
+              echo "Container exit status:"
+              docker inspect \
+                --format '{{.State.ExitCode}}' \
+                "$CONTAINER_NAME" 2>/dev/null || true
+
+              echo "Last container logs:"
+              docker logs --tail 200 "$CONTAINER_NAME" 2>&1 || true
+
               exit 1
             fi
+
+            echo "[$(TZ=Africa/Cairo date '+%H:%M:%S')] Bots are running."
 
             sleep 10
           done
 
+          echo "========================================"
           echo "Two hours completed."
-          docker logs --tail 100 "$CONTAINER_NAME" 2>&1 || true
+          echo "Final container logs:"
+          echo "========================================"
+
+          docker logs --tail 200 "$CONTAINER_NAME" 2>&1 || true
 
           cleanup
-          trap - EXIT INT TERM
+          trap - EXIT
 
           echo "Container stopped successfully."
+          echo "Cycle completed at: $(TZ=Africa/Cairo date)"
+          
+      # ==========================================
+      # 8. توضيح نتيجة التشغيل
+      # ==========================================
+      - name: Skip Message
+        if: steps.schedule.outputs.allowed == 'false'
+        shell: bash
+        run: |
+          echo "Execution skipped."
+          echo "Current Egypt time: $(TZ=Africa/Cairo date)"
+          echo "Next scheduled workflow will check the allowed hours."
