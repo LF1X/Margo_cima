@@ -1,0 +1,142 @@
+name: Auto Cycle
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-bot-cycle
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 135
+
+    env:
+      TZ: Africa/Cairo
+
+    steps:
+      - name: Check Egypt Time
+        id: schedule
+        shell: bash
+        run: |
+          HOUR=$(date +%H)
+
+          echo "Egypt time: $(date)"
+          echo "Current hour: $HOUR"
+
+          WORK_HOURS="09 10 21 22"
+
+          if [[ " $WORK_HOURS " == *" $HOUR "* ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "Inside working hours."
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+            echo "Manual start enabled."
+          else
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "Outside working hours."
+          fi
+
+      - name: Checkout Public Repository
+        if: steps.schedule.outputs.allowed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Checkout Private Repository
+        if: steps.schedule.outputs.allowed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: BXF8/PX
+          token: ${{ secrets.GH_TOKEN }}
+          path: private
+
+      - name: Verify Files
+        if: steps.schedule.outputs.allowed == 'true'
+        shell: bash
+        run: |
+          set -e
+
+          test -f private/Dockerfile || {
+            echo "Dockerfile not found"
+            exit 1
+          }
+
+          test -f private/start.sh || {
+            echo "start.sh not found"
+            exit 1
+          }
+
+          echo "Required files found."
+
+      - name: Set up Docker Buildx
+        if: steps.schedule.outputs.allowed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        if: steps.schedule.outputs.allowed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: ./private
+          file: ./private/Dockerfile
+          tags: telegram-bot:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run start.sh for Two Hours
+        if: steps.schedule.outputs.allowed == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          CONTAINER_NAME="telegram-bot-cycle"
+
+          cleanup() {
+            echo "Stopping container..."
+            docker stop --time 20 "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          }
+
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+          echo "Starting start.sh..."
+
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --init \
+            -e TZ=Africa/Cairo \
+            telegram-bot:latest
+
+          trap cleanup EXIT INT TERM
+
+          echo "start.sh is running."
+          echo "Maximum runtime: 2 hours."
+
+          END=$((SECONDS + 7200))
+
+          while (( SECONDS < END )); do
+            RUNNING=$(docker inspect \
+              --format '{{.State.Running}}' \
+              "$CONTAINER_NAME" 2>/dev/null || echo false)
+
+            if [[ "$RUNNING" != "true" ]]; then
+              echo "Container stopped unexpectedly."
+              docker logs "$CONTAINER_NAME" 2>&1 || true
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "Two hours completed."
+          docker logs --tail 100 "$CONTAINER_NAME" 2>&1 || true
+
+          cleanup
+          trap - EXIT INT TERM
+
+          echo "Container stopped successfully."
